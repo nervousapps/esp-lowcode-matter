@@ -1,0 +1,3241 @@
+From: Gautam Agrawal <gautam.agrawal@espressif.com>
+Date: Fri, 2 May 2025 14:14:07 +0530
+Subject: [PATCH] lp_core: Add support for uart driver
+
+* Supports both hp_uart port and lp_uart port.
+---
+ components/simple_uart/CMakeLists.txt         |    5 +
+ components/simple_uart/simple_uart.c          |  414 +++
+ components/simple_uart/simple_uart.h          |   65 +
+ products/uart_sensor/CMakeLists.txt           |   13 +
+ .../configuration/cd_cert_fff1_8000.der       |  Bin 0 -> 242 bytes
+ .../uart_sensor/configuration/data_model.bin  |  Bin 0 -> 2110 bytes
+ .../uart_sensor/configuration/data_model.zap  | 2226 +++++++++++++++++
+ .../configuration/product_config.json         |   42 +
+ .../configuration/product_info.json           |   19 +
+ products/uart_sensor/main/CMakeLists.txt      |    3 +
+ products/uart_sensor/main/app_driver.cpp      |  180 ++
+ products/uart_sensor/main/app_main.cpp        |   72 +
+ products/uart_sensor/main/app_priv.h          |   30 +
+ products/uart_sensor/sdkconfig.defaults       |    0
+ 14 files changed, 3069 insertions(+)
+ create mode 100644 components/simple_uart/CMakeLists.txt
+ create mode 100644 components/simple_uart/simple_uart.c
+ create mode 100644 components/simple_uart/simple_uart.h
+ create mode 100644 products/uart_sensor/CMakeLists.txt
+ create mode 100644 products/uart_sensor/configuration/cd_cert_fff1_8000.der
+ create mode 100644 products/uart_sensor/configuration/data_model.bin
+ create mode 100644 products/uart_sensor/configuration/data_model.zap
+ create mode 100644 products/uart_sensor/configuration/product_config.json
+ create mode 100644 products/uart_sensor/configuration/product_info.json
+ create mode 100644 products/uart_sensor/main/CMakeLists.txt
+ create mode 100644 products/uart_sensor/main/app_driver.cpp
+ create mode 100644 products/uart_sensor/main/app_main.cpp
+ create mode 100644 products/uart_sensor/main/app_priv.h
+ create mode 100644 products/uart_sensor/sdkconfig.defaults
+
+diff --git a/components/simple_uart/CMakeLists.txt b/components/simple_uart/CMakeLists.txt
+new file mode 100644
+index 0000000..2817693
+--- /dev/null
++++ b/components/simple_uart/CMakeLists.txt
+@@ -0,0 +1,5 @@
++idf_component_register(
++    SRC_DIRS .
++    INCLUDE_DIRS .
++    REQUIRES soc hal ulp esp_amp
++)
+diff --git a/components/simple_uart/simple_uart.c b/components/simple_uart/simple_uart.c
+new file mode 100644
+index 0000000..5388b1e
+--- /dev/null
++++ b/components/simple_uart/simple_uart.c
+@@ -0,0 +1,414 @@
++/*
++ * SPDX-FileCopyrightText: 2023-2025 Espressif Systems (Shanghai) CO LTD
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#include <soc/gpio_num.h>
++#include <soc/rtc_io_periph.h>
++#include <soc/uart_periph.h>
++#include <soc/gpio_struct.h>
++#include <soc/uart_struct.h>
++#include <soc/lpperi_struct.h>
++#include <soc/rtc.h>
++#include <hal/gpio_ll.h>
++#include <hal/gpio_types.h>
++#include <hal/uart_ll.h>
++#include <hal/uart_types.h>
++#include <hal/uart_hal.h>
++#include <hal/rtc_io_ll.h>
++#include <hal/clk_tree_ll.h>
++
++#include <esp_err.h>
++#include <lp_core_uart.h>
++#include <ulp_lp_core_utils.h>
++
++#include <esp_amp_platform.h>
++
++#include "simple_uart.h"
++
++#define UART_HW_FIFO_LEN(uart_num) ((uart_num < SOC_UART_HP_NUM) ? SOC_UART_FIFO_LEN : SOC_LP_UART_FIFO_LEN)
++
++#define UART_ERR_INT_FLAG         (UART_INTR_PARITY_ERR | UART_INTR_FRAM_ERR)
++#define UART_TX_INT_FLAG          (UART_INTR_TX_DONE)
++#define UART_RX_INT_FLAG          (UART_INTR_RXFIFO_FULL | UART_INTR_RXFIFO_TOUT | UART_INTR_RXFIFO_OVF)
++#define UART_TOUT_THRESH_DEFAULT  (10U)
++#define UART_FULL_THRESH_DEFAULT  (10U)
++
++static const char* TAG = "UART";
++
++static uart_hal_context_t hal;
++
++static inline void gpio_matrix_in(int gpio_num, uint32_t signal_idx, bool inv)
++{
++    gpio_func_in_sel_cfg_reg_t reg;
++    reg.in_sel = gpio_num;
++    reg.in_inv_sel = inv;
++    reg.sig_in_sel = 1;
++    GPIO.func_in_sel_cfg[signal_idx].val = reg.val;
++}
++
++static inline void gpio_matrix_out(int gpio_num, uint32_t signal_idx, bool out_inv, bool oen_inv)
++{
++    gpio_func_out_sel_cfg_reg_t reg;
++    reg.out_sel = signal_idx;
++    reg.out_inv_sel = out_inv;
++    reg.oen_inv_sel = oen_inv;
++    GPIO.func_out_sel_cfg[gpio_num].val = reg.val;
++}
++
++static esp_err_t lp_core_uart_check_timeout(uint32_t intr_mask, int32_t timeout, uint32_t *ticker)
++{
++    if (timeout > -1) {
++        /* If the timeout value is not -1, delay for 1 CPU cycle and keep track of ticks */
++        ulp_lp_core_delay_cycles(1);
++        *ticker = *ticker + 1;
++        if (*ticker >= timeout) {
++            /* Disable and clear interrupt bits */
++            uart_hal_disable_intr_mask(&hal, intr_mask);
++            uart_hal_clr_intsts_mask(&hal, intr_mask);
++
++            return ESP_ERR_TIMEOUT;
++        }
++    }
++
++    return ESP_OK;
++}
++
++#define UART_TX_IDLE_NUM_DEFAULT        (0)
++
++static esp_err_t uart_config_io(gpio_num_t pin, uint32_t idx, uart_port_t uart_port)
++{
++    /* Skip configuration if the IO is -1 */
++    if (pin < 0) {
++        return ESP_OK;
++    }
++
++    const uart_periph_sig_t *upin = &uart_periph_signal[uart_port].pins[idx];
++
++#if !SOC_LP_GPIO_MATRIX_SUPPORTED && SOC_UART_LP_NUM >= 1
++    if (uart_port >= LP_UART_NUM_0 && pin != upin->default_gpio) {
++        printf("%s: uart port does not suport gpio matrix use default gpio\n", TAG);
++        return ESP_ERR_INVALID_ARG;
++    }
++#endif
++
++    /* Connect pins */
++    gpio_dev_t *gpio_dev = GPIO_LL_GET_HW(GPIO_PORT_0);
++
++    if (uart_port < SOC_UART_HP_NUM) {
++        if (!(upin->iomux_func == -1 || upin->default_gpio == -1 || upin->default_gpio != pin)) {
++            gpio_ll_iomux_out(gpio_dev, pin, upin->iomux_func, false);
++
++            /* If the pin is input, we also have to redirect the signal,
++         * in order to bypasse the GPIO matrix. */
++            if (upin->input) {
++                gpio_ll_iomux_in(gpio_dev, pin, upin->signal);
++            }
++        } else {
++            gpio_ll_func_sel(gpio_dev, pin, PIN_FUNC_GPIO);
++
++            if (idx == SOC_UART_RX_PIN_IDX) {
++                    gpio_ll_pulldown_dis(gpio_dev, pin);
++                    gpio_ll_pullup_en(gpio_dev, pin);
++
++                    /* set gpio as input only */
++                    gpio_ll_input_enable(gpio_dev, pin);
++                    gpio_ll_output_disable(gpio_dev, pin);
++                    gpio_ll_od_disable(gpio_dev, pin);
++
++                    gpio_matrix_in(pin, UART_PERIPH_SIGNAL(uart_port, SOC_UART_RX_PIN_IDX), 0);
++            } else if (idx == SOC_UART_TX_PIN_IDX) {
++
++                gpio_ll_set_level(gpio_dev, pin, 1);
++                gpio_matrix_out(pin, UART_PERIPH_SIGNAL(uart_port, SOC_UART_TX_PIN_IDX), 0, 0);
++
++            } else if (idx == SOC_UART_RTS_PIN_IDX) {
++
++                /* set gpio as output only */
++                gpio_ll_output_enable(gpio_dev, pin);
++                gpio_ll_input_disable(gpio_dev, pin);
++                gpio_ll_od_disable(gpio_dev, pin);
++
++                gpio_matrix_out(pin, UART_PERIPH_SIGNAL(uart_port, SOC_UART_RTS_PIN_IDX), 0, 0);
++            } else if (idx == SOC_UART_CTS_PIN_IDX) {
++                /* pull_up only */
++                gpio_ll_pulldown_dis(gpio_dev, pin);
++                gpio_ll_pullup_en(gpio_dev, pin);
++
++                /* GPIO input enable */
++                gpio_ll_input_enable(gpio_dev, pin);
++                gpio_ll_output_disable(gpio_dev, pin);
++                gpio_ll_od_disable(gpio_dev, pin);
++
++                gpio_matrix_in(pin, UART_PERIPH_SIGNAL(uart_port, SOC_UART_CTS_PIN_IDX), 0);
++            } else {
++                printf("%s: configuring invalid index\n", TAG);
++                return ESP_ERR_INVALID_ARG;
++            }
++        }
++    } else {
++        if (upin->input) {
++            rtcio_ll_output_mode_set(pin, RTCIO_LL_OUTPUT_NORMAL);
++            rtcio_ll_output_disable(pin);
++            rtcio_ll_input_enable(pin);
++        } else {
++            rtcio_ll_output_mode_set(pin, RTCIO_LL_OUTPUT_NORMAL);
++            rtcio_ll_output_enable(pin);
++            rtcio_ll_input_disable(pin);
++        }
++        /* Enable LP clock */
++        LPPERI.clk_en.lp_io_ck_en = true;
++        rtcio_ll_function_select(rtc_io_num_map[pin], RTCIO_LL_FUNC_RTC);
++
++        rtcio_ll_iomux_func_sel(rtc_io_num_map[pin], upin->iomux_func);
++    }
++
++    return ESP_OK;
++}
++
++esp_err_t simple_uart_init(uart_port_t uart_port, lp_core_uart_cfg_t cfg)
++{
++    hal.dev = (uart_dev_t*)UART_LL_GET_HW(uart_port);
++
++    if (uart_port < SOC_UART_HP_NUM) {
++        uart_ll_disable_intr_mask(hal.dev, UART_LL_INTR_MASK);
++        uart_ll_clr_intsts_mask(hal.dev, UART_LL_INTR_MASK);
++        uart_ll_clr_intsts_mask(hal.dev, UART_LL_INTR_MASK);
++
++        uart_ll_enable_bus_clock(uart_port, true);
++        uart_ll_reset_register(uart_port);
++
++        soc_module_clk_t uart_sclk_sel = UART_SCLK_DEFAULT;
++        uart_ll_set_sclk(hal.dev, uart_sclk_sel);
++    } else {
++        _lp_uart_ll_enable_bus_clock(0, true);
++        LP_CLKRST.lpperi.lp_uart_clk_sel = 0;
++    }
++
++    /* initialise uart with default configurations */
++    uart_hal_init(&hal, uart_port);
++
++    if (uart_port < SOC_UART_HP_NUM) {
++        uint32_t source_freq = CLK_LL_PLL_80M_FREQ_MHZ * MHZ;
++        uart_ll_set_baudrate(hal.dev, cfg.uart_proto_cfg.baud_rate, source_freq);
++    } else {
++        if ((int)LP_UART_SCLK_DEFAULT == (int)SOC_MOD_CLK_RTC_FAST) {
++            uint32_t source_freq = (rtc_clk_xtal_freq_get() * MHZ) >> 1;
++            lp_uart_ll_set_baudrate(hal.dev, cfg.uart_proto_cfg.baud_rate, source_freq);
++        } else {
++            printf("%s: failed to configure the clock\n", TAG);
++            return ESP_FAIL;
++        }
++    }
++
++    /* Override protocol parameters from the configuration */
++    uart_ll_set_parity(hal.dev, cfg.uart_proto_cfg.parity);
++    uart_ll_set_data_bit_num(hal.dev, cfg.uart_proto_cfg.data_bits);
++    uart_ll_set_stop_bits(hal.dev, cfg.uart_proto_cfg.stop_bits);
++    uart_ll_set_tx_idle_num(hal.dev, UART_TX_IDLE_NUM_DEFAULT);
++    uart_ll_set_hw_flow_ctrl(hal.dev, cfg.uart_proto_cfg.flow_ctrl, cfg.uart_proto_cfg.rx_flow_ctrl_thresh);
++
++    /* Reset Tx/Rx FIFOs */
++    uart_ll_txfifo_rst(hal.dev);
++    uart_ll_rxfifo_rst(hal.dev);
++
++    esp_err_t err = ESP_OK;
++
++    /* Configure Tx Pin */
++    err = uart_config_io(cfg.uart_pin_cfg.tx_io_num, SOC_UART_TX_PIN_IDX, uart_port);
++    if (err != ESP_OK) {
++        printf("%s: Failed to configure tx io: %d\n", TAG, cfg.uart_pin_cfg.tx_io_num);
++        return err;
++    }
++    /* Configure Rx Pin */
++    err = uart_config_io(cfg.uart_pin_cfg.rx_io_num, SOC_UART_RX_PIN_IDX, uart_port);
++    if (err != ESP_OK) {
++        printf("%s: Failed to configure rx io: %d\n", TAG, cfg.uart_pin_cfg.rx_io_num);
++        return err;
++    }
++    /* Configure RTS Pin */
++    err = uart_config_io(cfg.uart_pin_cfg.rts_io_num, SOC_UART_RTS_PIN_IDX, uart_port);
++    if (err != ESP_OK) {
++        printf("%s: Failed to configure rts io: %d\n", TAG, cfg.uart_pin_cfg.rts_io_num);
++        return err;
++    }
++    /* Configure CTS Pin */
++    err = uart_config_io(cfg.uart_pin_cfg.cts_io_num, SOC_UART_CTS_PIN_IDX, uart_port);
++    if (err != ESP_OK) {
++        printf("%s: Failed to configure cts io: %d\n", TAG, cfg.uart_pin_cfg.cts_io_num);
++        return err;
++    }
++
++    return ESP_OK;
++}
++
++esp_err_t simple_uart_write_bytes(uart_port_t uart_num, const void *src, size_t size, int32_t timeout)
++{
++    if (size > UART_HW_FIFO_LEN(uart_num)) {
++        printf("%s: write failed, data buffer size exceeds fifo limit\n", TAG);
++        return ESP_FAIL;
++    }
++    esp_amp_platform_intr_disable();
++    hal.dev = (uart_dev_t*)UART_LL_GET_HW(uart_num);
++    /* Argument sanity check */
++    if (!src) {
++        esp_amp_platform_intr_enable();
++        /* Invalid input arguments */
++        return ESP_ERR_INVALID_ARG;
++    }
++
++    /* Nothing to do if the length is 0 */
++    if (size == 0) {
++        esp_amp_platform_intr_enable();
++        return ESP_OK;
++    }
++
++    /* Enable the Tx done interrupt */
++    uint32_t intr_mask = UART_TX_INT_FLAG | UART_ERR_INT_FLAG;
++    uart_hal_clr_intsts_mask(&hal, intr_mask);
++    uart_hal_ena_intr_mask(&hal, intr_mask);
++
++    /* Transmit data */
++    uint32_t tx_len;
++    uint32_t bytes_sent = 0;
++    int32_t remaining_bytes = size;
++    esp_err_t ret = ESP_OK;
++    uint32_t intr_status = 0;
++    uint32_t to = 0;
++
++    while (remaining_bytes > 0) {
++        /* Write to the Tx FIFO */
++        tx_len = 0;
++        uart_hal_write_txfifo(&hal, src + bytes_sent, remaining_bytes, &tx_len);
++
++        if (tx_len) {
++            /* We have managed to write some data to the Tx FIFO. Check Tx interrupt status */
++            while (1) {
++                /* Fetch the interrupt status */
++                intr_status = uart_hal_get_intsts_mask(&hal);
++                if (intr_status & UART_TX_INT_FLAG) {
++                    /* Clear interrupt status and break */
++                    uart_hal_clr_intsts_mask(&hal, intr_mask);
++                    break;
++                } else if ((intr_status & UART_ERR_INT_FLAG)) {
++
++                    esp_amp_platform_intr_enable();
++                    /* Transaction error. Abort */
++                    return ESP_FAIL;
++                }
++
++                /* Check for transaction timeout */
++                ret = lp_core_uart_check_timeout(intr_mask, timeout, &to);
++                if (ret == ESP_ERR_TIMEOUT) {
++                    /* Timeout */
++                    uart_hal_disable_intr_mask(&hal, intr_mask);
++                    esp_amp_platform_intr_enable();
++                    return ret;
++                }
++            }
++
++            /* Update the byte counters */
++            bytes_sent += tx_len;
++            remaining_bytes -= tx_len;
++        } else {
++            /* Tx FIFO does not have empty slots. Check for transaction timeout */
++            ret = lp_core_uart_check_timeout(intr_mask, timeout, &to);
++            if (ret == ESP_ERR_TIMEOUT) {
++                /* Timeout */
++                uart_hal_disable_intr_mask(&hal, intr_mask);
++                esp_amp_platform_intr_enable();
++                return ret;
++            }
++        }
++    }
++
++    /* Disable the Tx done interrupt */
++    uart_hal_disable_intr_mask(&hal, intr_mask);
++    esp_amp_platform_intr_enable();
++    return ret;
++}
++
++int simple_uart_read_bytes(uart_port_t uart_num, void *buf, size_t size, int32_t timeout)
++{
++
++    if (size > UART_HW_FIFO_LEN(uart_num)) {
++        printf("%s: read failed, data buffer size exceeds fifo limit\n", TAG);
++        return -1;
++    }
++
++    hal.dev = (uart_dev_t*)UART_LL_GET_HW(uart_num);
++
++    /* Argument sanity check */
++    if (!buf) {
++        /* Invalid input arguments */
++        return -1;
++    }
++
++    /* Nothing to do if the length is 0 */
++    if (size == 0) {
++        return 0;
++    }
++
++    /* Set the Rx interrupt thresholds */
++    uart_hal_set_rx_timeout(&hal, UART_TOUT_THRESH_DEFAULT);
++    uart_hal_set_rxfifo_full_thr(&hal, UART_FULL_THRESH_DEFAULT);
++
++    /* Enable the Rx interrupts */
++    uint32_t intr_mask = UART_RX_INT_FLAG | UART_ERR_INT_FLAG;
++    uart_hal_clr_intsts_mask(&hal, intr_mask);
++    // uart_hal_ena_intr_mask(&hal, intr_mask);
++
++    /* Receive data */
++    int rx_len = 0;
++    uint32_t bytes_rcvd = 0;
++    int32_t remaining_bytes = size;
++    esp_err_t ret = ESP_OK;
++    uint32_t intr_status = 0;
++    uint32_t to = 0;
++
++    while (remaining_bytes > 0) {
++        /* Read from the Rx FIFO
++         * We set rx_len to -1 to read all bytes in the Rx FIFO
++         */
++        rx_len = -1;
++        uart_hal_read_rxfifo(&hal, (uint8_t *)(buf + bytes_rcvd), &rx_len);
++
++        if (rx_len) {
++            /* We have some data to read from the Rx FIFO. Check Rx interrupt status */
++            intr_status = uart_hal_get_intsts_mask(&hal);
++            if ((intr_status & UART_INTR_RXFIFO_FULL) ||
++                    (intr_status & UART_INTR_RXFIFO_TOUT)) {
++                /* This is expected. Clear interrupt status and break */
++                uart_hal_clr_intsts_mask(&hal, intr_mask);
++                break;
++            } else if ((intr_status & UART_INTR_RXFIFO_OVF)) {
++                /* We reset the Rx FIFO if it overflows */
++                uart_hal_clr_intsts_mask(&hal, intr_mask);
++                uart_hal_rxfifo_rst(&hal);
++                break;
++            } else if ((intr_status & UART_ERR_INT_FLAG)) {
++                /* Transaction error. Abort */
++                uart_hal_clr_intsts_mask(&hal, intr_mask);
++                uart_hal_disable_intr_mask(&hal, intr_mask);
++                return -1;
++            }
++
++            /* Update the byte counters */
++            bytes_rcvd += rx_len;
++            remaining_bytes -= rx_len;
++        } else {
++            /* We have no data to read from the Rx FIFO. Check for transaction timeout */
++            ret = lp_core_uart_check_timeout(intr_mask, timeout, &to);
++            if (ret == ESP_ERR_TIMEOUT) {
++                break;
++            }
++        }
++    }
++
++    /* Disable the Rx interrupts */
++    uart_hal_disable_intr_mask(&hal, intr_mask);
++
++    /* Return the number of bytes received */
++    return bytes_rcvd;
++}
+diff --git a/components/simple_uart/simple_uart.h b/components/simple_uart/simple_uart.h
+new file mode 100644
+index 0000000..33959c8
+--- /dev/null
++++ b/components/simple_uart/simple_uart.h
+@@ -0,0 +1,65 @@
++/*
++ * SPDX-FileCopyrightText: 2023-2025 Espressif Systems (Shanghai) CO LTD
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#pragma once
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#include <hal/uart_types.h>
++
++#include <lp_core_uart.h>
++#include <esp_err.h>
++
++typedef lp_core_uart_cfg_t uart_cfg_t;
++
++/**
++ * @brief initialise the UART peripheral
++ *
++ * @param uart_port     uart port to use
++ * @param cfg           lp_core_uart_cfg_t configuration for uart
++ *
++ * @return esp_err_t    ESP_OK when successful
++ *
++ */
++esp_err_t simple_uart_init(uart_port_t uart_num, uart_cfg_t cfg);
++
++/**
++ * @brief Read data from the UART port
++ *
++ * This function will read data from the Rx FIFO. If a timeout value is configured, then this function will timeout once the number of CPU cycles expire.
++ *
++ * @param uart_num      UART port number
++ * @param buf           data buffer address
++ * @param size          data length to send
++ * @param timeout       Operation timeout in CPU cycles. Set to -1 to wait forever.
++ *
++ * @return              - (-1) Error
++ *                      - OTHERS (>=0) The number of bytes read from the Rx FIFO
++ */
++int simple_uart_read_bytes(uart_port_t uart_num, void *buf, size_t size, int32_t timeout);
++
++/**
++ * @brief Write data to the UART port
++ *
++ * This function will write data to the Tx FIFO. If a timeout value is configured, this function will timeout once the number of CPU cycles expire.
++ *
++ * @param uart_num      UART port number
++ * @param src           data buffer address
++ * @param size          data length to send
++ * @param timeout       Operation timeout in CPU cycles. Set to -1 to wait forever.
++ *
++ * @return esp_err_t    ESP_OK when successful
++ */
++esp_err_t simple_uart_write_bytes(uart_port_t uart_num, const void *src, size_t size, int32_t timeout);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/products/uart_sensor/CMakeLists.txt b/products/uart_sensor/CMakeLists.txt
+new file mode 100644
+index 0000000..dc3adc9
+--- /dev/null
++++ b/products/uart_sensor/CMakeLists.txt
+@@ -0,0 +1,13 @@
++# The following lines have to be present in your project's CMakeLists in this exact order for cmake to work correctly
++cmake_minimum_required(VERSION 3.16)
++
++include(../../tools/cmake/low_code.cmake)
++
++list(APPEND SDKCONFIG_DEFAULTS "sdkconfig.defaults")
++
++list(APPEND EXTRA_COMPONENT_DIRS
++    ../../components
++)
++
++set(PROJECT_VER "1.0")
++project(uart_sensor)
+diff --git a/products/uart_sensor/configuration/cd_cert_fff1_8000.der b/products/uart_sensor/configuration/cd_cert_fff1_8000.der
+new file mode 100644
+index 0000000000000000000000000000000000000000..4173ba891e6df8f9ff7be2697817481fa4292cb5
+GIT binary patch
+literal 242
+zcmV<O01f{zf$s(hDuzgg_YDCD0-%B6FoE6z0Ru4&Fbf6=V1`HmWdj5P0WeGk2`Yw2
+zhW8Bt2LYfz1U(fb00AWd@&7gg1pt5;Bm)5~1QSD3K{7HiFgHy>R5UO#FgGnSG$aK8
+zBnAK_2X>ew2mvJt@&6?X0Du@Vd@y<f0Rw;(V)}wJS*-f0mOdQ%6bjw-1oLrVFbf6=
+zV1`HmWdj5P0Wb;%2r7n1&OHPJ0t7}dL;@fW=`WCtE?1Y8S!00636*h{#BD=OSbC+}
+s4)FFoNs<ZzAbGiC){`9lJPe7bS`OAESWuUucgELh=ESTrOv}G^o`^$Bv;Y7A
+
+literal 0
+KcmV+b0RR6000031
+
+diff --git a/products/uart_sensor/configuration/data_model.bin b/products/uart_sensor/configuration/data_model.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..bcc8ddf183189c475c6a32516cf46b20c7594813
+GIT binary patch
+literal 2110
+zcmV-E2*LLV2n8|(2mlZO3J3-|1_%HU78n5v2m~qy2mlZr7(fsR0TK)d01zD*03ZM=
+z0tf^U2muld2mlZr7y%#vDgp=u5C{Ph3<v-a9T);204f3q1P}-T5)23c5FHo;AOI=?
+z2m}%c0TK=f01zD*`u_tU04f3q1QrMZ5)udi5FHr&{{tWZDh3D=5&}p85(ohj4hR4c
+z9T@%p10Vn@0tgBU2m~qy2mlZt7(fsR0TK)d01zJ-03ZP>0tf^U2muld2mlZt7y%#w
+zDgp=u5C{Ph3<v-a9~c5404f3q3J?eZ5)23c5FZ!=AOI=?2nrAg0TK)d01zJ-1Rww^
+z0tgBc2mulf2mlZt82bMMAOI=?2m}@g0TL1j01zJ-{Qm<W04fFu5)uMP01^lR5)KFe
+z5FZ%*{{tWZDgp=!3J3%$1_%HUC>THx2muld2mlZ$7yuvuDgp=!5(ohj4hR4cC>Q}C
+z04f3q1u!5G2muld2mlZ$7y=*wDgp=!5(ohj4hR4cC>R4E04f3q1u!5G2muld2mlZ$
+z7z7{yDgp=!5(ohj4hR4cC>RAG0V)Cr1u!5I2mulf2mlZ$7zQ8#Dgp=vFai(=0TK)d
+z01zk`2Ot0{0tgBc2mulf2mlZ$7ziK$Dgp=vFhCFp0TK)d01zk`2_OI}0tgHe2mulf
+z2mlZ$7z!W&Dgp=vFhCFp0TK)d01zk`6CeO80tf^U2muld2mlZ$7!@D@Dgp=$5C{Ph
+z3<v-aC>RzX04f3q3K9qb5)KFe5GWY>{{tWZDgp=u76<_n5(oegC>Z?z10Vn@1_%-o
+z0!RQB2mulj2mlZ$82$ePAOI=`2nrGcI0Fg@1S$py01zt}KoST65)KFe5Gxn}AOR`@
+z2n8@B5C{Ph3<v-aD;NPF04f3q1QG}V5)KFe5Gxq^{{tWZDgp=u76<_n5(oegD;WI$
+z10Vn@1_%-o0!RQB2mulj2mlZ(82$ePAOI=`2nrGcH~|U>1S$py01z-3Kokf85)cRg
+z5HJ`3AOR`{2o4egSO5?R0TK)d01z-30U!V>0tf^U2muld2mlZ;7y=*wDgp=(5C{Ph
+z3<v-aFc<?M04f3q4-g0e5)23c5HJ`7AOI=?2mulZ0TK=f01z-3`u_tU04f3q1QrMZ
+z5)udi5HJ}0{{tWZDh3D=5&}p776<_n5(oegFc|&+10Vn@1_%lg0yqH-2m%@i2mlZ;
+z7yuvw3<v@m2nYZWFc<+K1PllQ8VCpg5HJ`5AOZ{s0vZSi01z-310Vzp2m%@i2mlZ;
+z7z7{!3<v@m2nYZWFc<|O1PTZQDh3Du5HT1)5C{Ph3<v-aF&F?K04f3q2oMMX5)23c
+z5HT15AOI=?2m}xa0TK)d01z=41Rwz_0tf*R2muld2mlZ<7zH3eDgp=(5(ohj4hR4c
+zF&G9QKq>+V1~4EH2muld2mlZ<7zZFgDgp=#5(ohj4hR4cF&O&)10Vn@0tf^a2mulj
+z2mlZ<82tYOAOI=`2oe$kNB|ZH0TL1j01z=4{r>|X04fFu3K9Z10SX8NDh3Du5HlD+
+z5C{Ph3<v-aGZ+9M04f3q1P}-T5)23c5HlD7AOI=?2nrAg0TK)d01z`60w4e?0tgNe
+z2muld2mlZ>7ziK$Dgp=r5(ohj4hR4cGZ^~+10Vn@0tf^a2mulj2mlZ>82tYOAOI=`
+z2oe$kNC6TE0TK=f01z`6{r>|X04f3q3JeGW8VCpg5HlD6AOZ{s0vZSi01z`60U!bl
+z2m%@i2mlZ>7y=*!3J3%$1_%HUJQzR_2muld2mlZ~7yuvuDgp=(5C{Ph3<v-aJQx8W
+zKq>+V2oMMX5)23c5Ih(HAV4Yt2nrGi0TK=f01!MF`u_tU04f3q1QrMZ5)udi5Ih+C
+z{{tWZDh3D=5&}p776<_n5(oegJQ)4|10Vn@1_%lg0yqH-2m%@i2mlZ~7yuvw3<v@m
+z2nYZWJQxBX0tyHODh3Du5Iz_{5C{Ph3<v-aJ{SNX04f3q1P}-T5)23c5Iz_IAOI=?
+z2m~1j0TLAm01!SH0w4e?0tg5?0w@JS11SCh5C{Ph3<v-aJ{SWa04f3q2oMMX5)23c
+z5Iz_LAOI=?2m}xa0TK)d01!SH1t0(_0tg5a2mulf2mla182bMMAOI=?2m}@g0TL1j
+z01!SH{Qm<W04fFu5)uMP02T-V5)udi5Iz|F{{tWZDh3D&5&}2@3<v@m2nYZWJ{SNX
+z0t^TO8VCpg5Iz_IAOs8u0vZSi01!SH0w4km2m%@i2mla17y}>#3<v@m2nYZWJ{SZb
+z0t^TO8VCpg5Iz_MAOs8u0vZSi01!SH1|R|q2m%@i2mla17ziK)3<v@m2nYZWJ{Sie
+z0t^TO8VCpg5Iz_PAOs8u0vZSi01!SH2_OOt2m%@i2mla17ziK)3<v@m2nYZWJ{Srh
+z0t^TO8VCpg5Iz_PAOs8u0vZSi01!SH3m^gt2m~qy2mla27(fsR0TK)d01!VI03ZP>
+z0tf^U2muld2mla27y%#vDgp=u5C{Ph3<v-aKNtca04f3q3J?eZ5)23c5I-0LAOI=?
+z2nrGi0TK=f01!VI`u_tU04f3q1QrMZ5)udi5I-3F{{tWZDh3D=5&}p85(ohj4hR4c
+zKN$W010Vn@0tgBW2m%@i2mla27yuvw3<v@m2nYZWKNtZZ0t^TO8VCpg5I-0KAOs8u
+o0vZSi01!VI10Vtn2m%@i2mla27z7{!3<v@m2nYZWKNtld1X}95NdN!<
+
+literal 0
+KcmV+b0RR6000031
+
+diff --git a/products/uart_sensor/configuration/data_model.zap b/products/uart_sensor/configuration/data_model.zap
+new file mode 100644
+index 0000000..43a2dc4
+--- /dev/null
++++ b/products/uart_sensor/configuration/data_model.zap
+@@ -0,0 +1,2226 @@
++{
++  "fileFormat": 2,
++  "featureLevel": 100,
++  "creator": "zap",
++  "keyValuePairs": [
++    {
++      "key": "commandDiscovery",
++      "value": "1"
++    },
++    {
++      "key": "defaultResponsePolicy",
++      "value": "always"
++    },
++    {
++      "key": "manufacturerCodes",
++      "value": "0x131B"
++    }
++  ],
++  "package": [
++    {
++      "pathRelativity": "resolveEnvVars",
++      "path": "$ESP_MATTER_PATH/connectedhomeip/connectedhomeip/src/app/zap-templates/zcl/zcl.json",
++      "type": "zcl-properties",
++      "category": "matter",
++      "version": 1,
++      "description": "Matter SDK ZCL data"
++    },
++    {
++      "pathRelativity": "resolveEnvVars",
++      "path": "$ESP_MATTER_PATH/connectedhomeip/connectedhomeip/src/app/zap-templates/app-templates.json",
++      "type": "gen-templates-json",
++      "version": "chip-v1"
++    }
++  ],
++  "endpointTypes": [
++    {
++      "id": 1,
++      "name": "Anonymous Endpoint Type",
++      "deviceTypeRef": {
++        "code": 22,
++        "profileId": 259,
++        "label": "MA-rootdevice",
++        "name": "MA-rootdevice"
++      },
++      "deviceTypes": [
++        {
++          "code": 22,
++          "profileId": 259,
++          "label": "MA-rootdevice",
++          "name": "MA-rootdevice"
++        }
++      ],
++      "deviceVersions": [
++        1
++      ],
++      "deviceIdentifiers": [
++        22
++      ],
++      "deviceTypeName": "MA-rootdevice",
++      "deviceTypeCode": 22,
++      "deviceTypeProfileId": 259,
++      "clusters": [
++        {
++          "name": "Descriptor",
++          "code": 29,
++          "mfgCode": null,
++          "define": "DESCRIPTOR_CLUSTER",
++          "side": "server",
++          "enabled": 1,
++          "attributes": [
++            {
++              "name": "DeviceTypeList",
++              "code": 0,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "ServerList",
++              "code": 1,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "ClientList",
++              "code": 2,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "PartsList",
++              "code": 3,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "GeneratedCommandList",
++              "code": 65528,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AcceptedCommandList",
++              "code": 65529,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "EventList",
++              "code": 65530,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AttributeList",
++              "code": 65531,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "FeatureMap",
++              "code": 65532,
++              "mfgCode": null,
++              "side": "server",
++              "type": "bitmap32",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "ClusterRevision",
++              "code": 65533,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            }
++          ]
++        },
++        {
++          "name": "Access Control",
++          "code": 31,
++          "mfgCode": null,
++          "define": "ACCESS_CONTROL_CLUSTER",
++          "side": "server",
++          "enabled": 1,
++          "attributes": [
++            {
++              "name": "ACL",
++              "code": 0,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "Extension",
++              "code": 1,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "SubjectsPerAccessControlEntry",
++              "code": 2,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "TargetsPerAccessControlEntry",
++              "code": 3,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AccessControlEntriesPerFabric",
++              "code": 4,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "GeneratedCommandList",
++              "code": 65528,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AcceptedCommandList",
++              "code": 65529,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "EventList",
++              "code": 65530,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AttributeList",
++              "code": 65531,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "FeatureMap",
++              "code": 65532,
++              "mfgCode": null,
++              "side": "server",
++              "type": "bitmap32",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "0",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "ClusterRevision",
++              "code": 65533,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            }
++          ]
++        },
++        {
++          "name": "Basic Information",
++          "code": 40,
++          "mfgCode": null,
++          "define": "BASIC_INFORMATION_CLUSTER",
++          "side": "server",
++          "enabled": 1,
++          "attributes": [
++            {
++              "name": "DataModelRevision",
++              "code": 0,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "VendorName",
++              "code": 1,
++              "mfgCode": null,
++              "side": "server",
++              "type": "char_string",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "VendorID",
++              "code": 2,
++              "mfgCode": null,
++              "side": "server",
++              "type": "vendor_id",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "ProductName",
++              "code": 3,
++              "mfgCode": null,
++              "side": "server",
++              "type": "char_string",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "ProductID",
++              "code": 4,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "NodeLabel",
++              "code": 5,
++              "mfgCode": null,
++              "side": "server",
++              "type": "char_string",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": "",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "Location",
++              "code": 6,
++              "mfgCode": null,
++              "side": "server",
++              "type": "char_string",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "HardwareVersion",
++              "code": 7,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "HardwareVersionString",
++              "code": 8,
++              "mfgCode": null,
++              "side": "server",
++              "type": "char_string",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "SoftwareVersion",
++              "code": 9,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int32u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "SoftwareVersionString",
++              "code": 10,
++              "mfgCode": null,
++              "side": "server",
++              "type": "char_string",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "CapabilityMinima",
++              "code": 19,
++              "mfgCode": null,
++              "side": "server",
++              "type": "CapabilityMinimaStruct",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "SpecificationVersion",
++              "code": 21,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int32u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "MaxPathsPerInvoke",
++              "code": 22,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "GeneratedCommandList",
++              "code": 65528,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AcceptedCommandList",
++              "code": 65529,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "EventList",
++              "code": 65530,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AttributeList",
++              "code": 65531,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "FeatureMap",
++              "code": 65532,
++              "mfgCode": null,
++              "side": "server",
++              "type": "bitmap32",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": "0",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "ClusterRevision",
++              "code": 65533,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 1,
++              "bounded": 0,
++              "defaultValue": "3",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            }
++          ]
++        },
++        {
++          "name": "Localization Configuration",
++          "code": 43,
++          "mfgCode": null,
++          "define": "LOCALIZATION_CONFIGURATION_CLUSTER",
++          "side": "server",
++          "enabled": 1,
++          "attributes": [
++            {
++              "name": "ActiveLocale",
++              "code": 0,
++              "mfgCode": null,
++              "side": "server",
++              "type": "char_string",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "SupportedLocales",
++              "code": 1,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "GeneratedCommandList",
++              "code": 65528,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AcceptedCommandList",
++              "code": 65529,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "EventList",
++              "code": 65530,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AttributeList",
++              "code": 65531,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "FeatureMap",
++              "code": 65532,
++              "mfgCode": null,
++              "side": "server",
++              "type": "bitmap32",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "0",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "ClusterRevision",
++              "code": 65533,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "1",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            }
++          ]
++        },
++        {
++          "name": "General Commissioning",
++          "code": 48,
++          "mfgCode": null,
++          "define": "GENERAL_COMMISSIONING_CLUSTER",
++          "side": "server",
++          "enabled": 1,
++          "commands": [
++            {
++              "name": "ArmFailSafe",
++              "code": 0,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "ArmFailSafeResponse",
++              "code": 1,
++              "mfgCode": null,
++              "source": "server",
++              "isIncoming": 0,
++              "isEnabled": 1
++            },
++            {
++              "name": "SetRegulatoryConfig",
++              "code": 2,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "SetRegulatoryConfigResponse",
++              "code": 3,
++              "mfgCode": null,
++              "source": "server",
++              "isIncoming": 0,
++              "isEnabled": 1
++            },
++            {
++              "name": "CommissioningComplete",
++              "code": 4,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "CommissioningCompleteResponse",
++              "code": 5,
++              "mfgCode": null,
++              "source": "server",
++              "isIncoming": 0,
++              "isEnabled": 1
++            }
++          ],
++          "attributes": [
++            {
++              "name": "Breadcrumb",
++              "code": 0,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int64u",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "0x0000000000000000",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "BasicCommissioningInfo",
++              "code": 1,
++              "mfgCode": null,
++              "side": "server",
++              "type": "BasicCommissioningInfo",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "RegulatoryConfig",
++              "code": 2,
++              "mfgCode": null,
++              "side": "server",
++              "type": "RegulatoryLocationTypeEnum",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "LocationCapability",
++              "code": 3,
++              "mfgCode": null,
++              "side": "server",
++              "type": "RegulatoryLocationTypeEnum",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "SupportsConcurrentConnection",
++              "code": 4,
++              "mfgCode": null,
++              "side": "server",
++              "type": "boolean",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "GeneratedCommandList",
++              "code": 65528,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AcceptedCommandList",
++              "code": 65529,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "EventList",
++              "code": 65530,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AttributeList",
++              "code": 65531,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "FeatureMap",
++              "code": 65532,
++              "mfgCode": null,
++              "side": "server",
++              "type": "bitmap32",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "0",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "ClusterRevision",
++              "code": 65533,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "1",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            }
++          ]
++        },
++        {
++          "name": "Network Commissioning",
++          "code": 49,
++          "mfgCode": null,
++          "define": "NETWORK_COMMISSIONING_CLUSTER",
++          "side": "server",
++          "enabled": 1,
++          "attributes": [
++            {
++              "name": "MaxNetworks",
++              "code": 0,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int8u",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "Networks",
++              "code": 1,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "InterfaceEnabled",
++              "code": 4,
++              "mfgCode": null,
++              "side": "server",
++              "type": "boolean",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "LastNetworkingStatus",
++              "code": 5,
++              "mfgCode": null,
++              "side": "server",
++              "type": "NetworkCommissioningStatusEnum",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "LastNetworkID",
++              "code": 6,
++              "mfgCode": null,
++              "side": "server",
++              "type": "octet_string",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "LastConnectErrorValue",
++              "code": 7,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int32s",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "GeneratedCommandList",
++              "code": 65528,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AcceptedCommandList",
++              "code": 65529,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "EventList",
++              "code": 65530,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AttributeList",
++              "code": 65531,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "FeatureMap",
++              "code": 65532,
++              "mfgCode": null,
++              "side": "server",
++              "type": "bitmap32",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "0",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "ClusterRevision",
++              "code": 65533,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "1",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            }
++          ]
++        },
++        {
++          "name": "General Diagnostics",
++          "code": 51,
++          "mfgCode": null,
++          "define": "GENERAL_DIAGNOSTICS_CLUSTER",
++          "side": "server",
++          "enabled": 1,
++          "commands": [
++            {
++              "name": "TestEventTrigger",
++              "code": 0,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "TimeSnapshot",
++              "code": 1,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "TimeSnapshotResponse",
++              "code": 2,
++              "mfgCode": null,
++              "source": "server",
++              "isIncoming": 0,
++              "isEnabled": 1
++            }
++          ],
++          "attributes": [
++            {
++              "name": "NetworkInterfaces",
++              "code": 0,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "RebootCount",
++              "code": 1,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "UpTime",
++              "code": 2,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int64u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "TestEventTriggersEnabled",
++              "code": 8,
++              "mfgCode": null,
++              "side": "server",
++              "type": "boolean",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "GeneratedCommandList",
++              "code": 65528,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AcceptedCommandList",
++              "code": 65529,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "EventList",
++              "code": 65530,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AttributeList",
++              "code": 65531,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "FeatureMap",
++              "code": 65532,
++              "mfgCode": null,
++              "side": "server",
++              "type": "bitmap32",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "ClusterRevision",
++              "code": 65533,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            }
++          ]
++        },
++        {
++          "name": "Administrator Commissioning",
++          "code": 60,
++          "mfgCode": null,
++          "define": "ADMINISTRATOR_COMMISSIONING_CLUSTER",
++          "side": "server",
++          "enabled": 1,
++          "commands": [
++            {
++              "name": "OpenCommissioningWindow",
++              "code": 0,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "RevokeCommissioning",
++              "code": 2,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            }
++          ],
++          "attributes": [
++            {
++              "name": "WindowStatus",
++              "code": 0,
++              "mfgCode": null,
++              "side": "server",
++              "type": "CommissioningWindowStatusEnum",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AdminFabricIndex",
++              "code": 1,
++              "mfgCode": null,
++              "side": "server",
++              "type": "fabric_idx",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AdminVendorId",
++              "code": 2,
++              "mfgCode": null,
++              "side": "server",
++              "type": "vendor_id",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "GeneratedCommandList",
++              "code": 65528,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AcceptedCommandList",
++              "code": 65529,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "EventList",
++              "code": 65530,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AttributeList",
++              "code": 65531,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "FeatureMap",
++              "code": 65532,
++              "mfgCode": null,
++              "side": "server",
++              "type": "bitmap32",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "0",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "ClusterRevision",
++              "code": 65533,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "1",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            }
++          ]
++        },
++        {
++          "name": "Operational Credentials",
++          "code": 62,
++          "mfgCode": null,
++          "define": "OPERATIONAL_CREDENTIALS_CLUSTER",
++          "side": "server",
++          "enabled": 1,
++          "commands": [
++            {
++              "name": "AttestationRequest",
++              "code": 0,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "AttestationResponse",
++              "code": 1,
++              "mfgCode": null,
++              "source": "server",
++              "isIncoming": 0,
++              "isEnabled": 1
++            },
++            {
++              "name": "CertificateChainRequest",
++              "code": 2,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "CertificateChainResponse",
++              "code": 3,
++              "mfgCode": null,
++              "source": "server",
++              "isIncoming": 0,
++              "isEnabled": 1
++            },
++            {
++              "name": "CSRRequest",
++              "code": 4,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "CSRResponse",
++              "code": 5,
++              "mfgCode": null,
++              "source": "server",
++              "isIncoming": 0,
++              "isEnabled": 1
++            },
++            {
++              "name": "AddNOC",
++              "code": 6,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "UpdateNOC",
++              "code": 7,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "NOCResponse",
++              "code": 8,
++              "mfgCode": null,
++              "source": "server",
++              "isIncoming": 0,
++              "isEnabled": 1
++            },
++            {
++              "name": "UpdateFabricLabel",
++              "code": 9,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "RemoveFabric",
++              "code": 10,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "AddTrustedRootCertificate",
++              "code": 11,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            }
++          ],
++          "attributes": [
++            {
++              "name": "NOCs",
++              "code": 0,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "Fabrics",
++              "code": 1,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "SupportedFabrics",
++              "code": 2,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int8u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "CommissionedFabrics",
++              "code": 3,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int8u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "TrustedRootCertificates",
++              "code": 4,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "CurrentFabricIndex",
++              "code": 5,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int8u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "GeneratedCommandList",
++              "code": 65528,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AcceptedCommandList",
++              "code": 65529,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "EventList",
++              "code": 65530,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AttributeList",
++              "code": 65531,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "FeatureMap",
++              "code": 65532,
++              "mfgCode": null,
++              "side": "server",
++              "type": "bitmap32",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "0",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "ClusterRevision",
++              "code": 65533,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "RAM",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": "1",
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            }
++          ]
++        },
++        {
++          "name": "Group Key Management",
++          "code": 63,
++          "mfgCode": null,
++          "define": "GROUP_KEY_MANAGEMENT_CLUSTER",
++          "side": "server",
++          "enabled": 1,
++          "commands": [
++            {
++              "name": "KeySetWrite",
++              "code": 0,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "KeySetRead",
++              "code": 1,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "KeySetReadResponse",
++              "code": 2,
++              "mfgCode": null,
++              "source": "server",
++              "isIncoming": 0,
++              "isEnabled": 1
++            },
++            {
++              "name": "KeySetRemove",
++              "code": 3,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "KeySetReadAllIndices",
++              "code": 4,
++              "mfgCode": null,
++              "source": "client",
++              "isIncoming": 1,
++              "isEnabled": 1
++            },
++            {
++              "name": "KeySetReadAllIndicesResponse",
++              "code": 5,
++              "mfgCode": null,
++              "source": "server",
++              "isIncoming": 0,
++              "isEnabled": 1
++            }
++          ],
++          "attributes": [
++            {
++              "name": "GroupKeyMap",
++              "code": 0,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "GroupTable",
++              "code": 1,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "MaxGroupsPerFabric",
++              "code": 2,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "MaxGroupKeysPerFabric",
++              "code": 3,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "GeneratedCommandList",
++              "code": 65528,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AcceptedCommandList",
++              "code": 65529,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "EventList",
++              "code": 65530,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "AttributeList",
++              "code": 65531,
++              "mfgCode": null,
++              "side": "server",
++              "type": "array",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "FeatureMap",
++              "code": 65532,
++              "mfgCode": null,
++              "side": "server",
++              "type": "bitmap32",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            },
++            {
++              "name": "ClusterRevision",
++              "code": 65533,
++              "mfgCode": null,
++              "side": "server",
++              "type": "int16u",
++              "included": 1,
++              "storageOption": "External",
++              "singleton": 0,
++              "bounded": 0,
++              "defaultValue": null,
++              "reportable": 1,
++              "minInterval": 1,
++              "maxInterval": 65534,
++              "reportableChange": 0
++            }
++          ]
++        }
++      ]
++    }
++  ],
++  "endpoints": [
++    {
++      "endpointTypeName": "Anonymous Endpoint Type",
++      "endpointTypeIndex": 0,
++      "profileId": 259,
++      "endpointId": 0,
++      "networkId": 0,
++      "parentEndpointIdentifier": null
++    }
++  ]
++}
+diff --git a/products/uart_sensor/configuration/product_config.json b/products/uart_sensor/configuration/product_config.json
+new file mode 100644
+index 0000000..63c35f3
+--- /dev/null
++++ b/products/uart_sensor/configuration/product_config.json
+@@ -0,0 +1,42 @@
++{
++    "config_version": 3,
++    "product_common": [
++        {
++            "type": "ezc.product_common.factory_reset",
++            "subtype": 1,
++            "count": 3,
++            "auto_trigger": true
++        }
++    ],
++    "test_mode": [
++        {
++            "type": "ezc.test_mode.common",
++            "subtype": 1
++        },
++        {
++            "type": "ezc.test_mode.ble",
++            "subtype": 1
++        },
++        {
++            "type": "ezc.test_mode.sniffer",
++            "subtype": 1,
++            "trigger": 3
++        },
++        {
++            "type": "ezc.test_mode.low_code",
++            "subtype": 1,
++            "ssid": "test_low_code_1"
++        },
++        {
++            "type": "ezc.test_mode.low_code",
++            "subtype": 2,
++            "ssid": "test_low_code_2"
++        },
++        {
++            "type": "ezc.test_mode.low_code",
++            "subtype": 3,
++            "ssid": "test_low_code_3"
++        }
++    ],
++    "device_management": true
++}
+diff --git a/products/uart_sensor/configuration/product_info.json b/products/uart_sensor/configuration/product_info.json
+new file mode 100644
+index 0000000..21ae107
+--- /dev/null
++++ b/products/uart_sensor/configuration/product_info.json
+@@ -0,0 +1,19 @@
++{
++    "config_version": 3,
++    "vendor_id": 65521,
++    "product_id": 32768,
++    "origin_vendor_id": 65521,
++    "origin_product_id": 32768,
++    "device_type_id": 1,
++    "vendor_name": "Espressif",
++    "product_name": "Matter Product",
++    "hw_ver": 1,
++    "hw_ver_str": "1",
++    "chip": "esp32c6",
++    "connection_type": "wifi",
++    "module": "ESP32-C6-MINI-1",
++    "flash_size": "4MB",
++    "secure_boot": "enabled",
++    "product_type": "template",
++    "solution_type": "low_code"
++}
+diff --git a/products/uart_sensor/main/CMakeLists.txt b/products/uart_sensor/main/CMakeLists.txt
+new file mode 100644
+index 0000000..ac84e28
+--- /dev/null
++++ b/products/uart_sensor/main/CMakeLists.txt
+@@ -0,0 +1,3 @@
++idf_component_register(SRC_DIRS .
++                        INCLUDE_DIRS .
++                        REQUIRES low_code system ulp simple_uart)
+diff --git a/products/uart_sensor/main/app_driver.cpp b/products/uart_sensor/main/app_driver.cpp
+new file mode 100644
+index 0000000..a96d02a
+--- /dev/null
++++ b/products/uart_sensor/main/app_driver.cpp
+@@ -0,0 +1,180 @@
++// Copyright 2024 Espressif Systems (Shanghai) PTE LTD
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include <stdio.h>
++#include <string.h>
++
++#include <esp_amp_platform.h>
++
++#include "app_priv.h"
++#include "simple_uart.h"
++
++static const char *TAG = "app_driver";
++
++#define RX_GPIO_NUM     (gpio_num_t)GPIO_NUM_8
++#define TX_GPIO_NUM     (gpio_num_t)GPIO_NUM_10
++#define RTS_GPIO_NUM    (gpio_num_t)(-1)
++#define CTS_GPIO_NUM    (gpio_num_t)(-1)
++
++#define RX_BUFFER_SIZE  50
++#define TX_BUFFER_SIZE  50
++
++// #define UART_PORT_NUM    LP_UART_NUM_0
++#define UART_PORT_NUM    UART_NUM_1
++
++int app_driver_uart_echo(void)
++{
++    static int count = 0;
++
++    /* creating the tx buffer */
++    char tx_buffer[TX_BUFFER_SIZE];
++    int tx_len = snprintf(tx_buffer, TX_BUFFER_SIZE, "%d: Hello", ++count);
++
++    /* checking for buffer overflow */
++    if (tx_len >= 50) {
++        printf("%s: rx buffer overflow, please increase the rx buffer size", TAG);
++    }
++
++    /* transmiting tx_buiffer via uart port */
++    esp_err_t ret = simple_uart_write_bytes(UART_PORT_NUM, tx_buffer, tx_len, 500);
++    if (ret != ESP_OK) {
++        printf("%s: Error in transmiting data\n", TAG);
++        esp_amp_platform_delay_ms(200);
++        return -1;
++    }
++
++    /* delay of 10 ms */
++    esp_amp_platform_delay_ms(10);
++
++    /* receviing data from the rx uart port */
++    char rx_buffer[RX_BUFFER_SIZE];
++    int rx_len = simple_uart_read_bytes(UART_PORT_NUM, rx_buffer, RX_BUFFER_SIZE, 10);
++
++    if (rx_len > 0) {
++        /* printing the received data */
++        printf("%s: Received UART Data:\n%s\n", TAG, rx_buffer);
++    }
++
++    /* delay of 1 sec */
++    esp_amp_platform_delay_ms(1000);
++
++    return 0;
++}
++
++int app_driver_init()
++{
++    printf("%s: Initializing driver\n", TAG);
++
++    /* uart driver config */
++    static uart_cfg_t cfg = {
++        .uart_pin_cfg = {
++            .tx_io_num = TX_GPIO_NUM,
++            .rx_io_num = RX_GPIO_NUM,
++            .rts_io_num = RTS_GPIO_NUM,
++            .cts_io_num = CTS_GPIO_NUM,
++        },
++        /* Default UART protocol config */
++        .uart_proto_cfg = {
++            .baud_rate = 115200,
++            .data_bits = UART_DATA_8_BITS,
++            .parity = UART_PARITY_DISABLE,
++            .stop_bits = UART_STOP_BITS_1,
++            .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
++            .rx_flow_ctrl_thresh = 0,
++        },
++    };
++
++    /* initialise the uart drvier */
++    esp_err_t err = simple_uart_init(UART_PORT_NUM, cfg);
++    if (err != ESP_OK) {
++        printf("%s: Failed to initialise the UART driver\n", TAG);
++        return -1;
++    }
++    printf("%s: UART driver initialized successfully\n", TAG);
++
++    return 0;
++}
++
++int app_driver_feature_update()
++{
++    printf("%s: Feature update\n", TAG);
++    /* Add code to handle feature updates for the device */
++    /* Appropriate arguments might need to be passed to the function */
++
++    return 0;
++}
++
++int app_driver_event_handler(low_code_event_t *event)
++{
++    printf("%s: Received event: %d\n", TAG, event->event_type);
++
++    switch (event->event_type) {
++        case LOW_CODE_EVENT_SETUP_MODE_START:
++            printf("%s: Setup mode started\n", TAG);
++            break;
++        case LOW_CODE_EVENT_SETUP_MODE_END:
++            printf("%s: Setup mode ended\n", TAG);
++            break;
++        case LOW_CODE_EVENT_SETUP_DEVICE_CONNECTED:
++            printf("%s: Device connected during setup\n", TAG);
++            break;
++        case LOW_CODE_EVENT_SETUP_STARTED:
++            printf("%s: Setup process started\n", TAG);
++            break;
++        case LOW_CODE_EVENT_SETUP_SUCCESSFUL:
++            printf("%s: Setup process successful\n", TAG);
++            break;
++        case LOW_CODE_EVENT_SETUP_FAILED:
++            printf("%s: Setup process failed\n", TAG);
++            break;
++        case LOW_CODE_EVENT_NETWORK_CONNECTED:
++            printf("%s: Network connected\n", TAG);
++            break;
++        case LOW_CODE_EVENT_NETWORK_DISCONNECTED:
++            printf("%s: Network disconnected\n", TAG);
++            break;
++        case LOW_CODE_EVENT_OTA_STARTED:
++            printf("%s: OTA update started\n", TAG);
++            break;
++        case LOW_CODE_EVENT_OTA_STOPPED:
++            printf("%s: OTA update stopped\n", TAG);
++            break;
++        case LOW_CODE_EVENT_READY:
++            printf("%s: Device is ready\n", TAG);
++            break;
++        case LOW_CODE_EVENT_IDENTIFICATION_START:
++            printf("%s: Identification started\n", TAG);
++            break;
++        case LOW_CODE_EVENT_IDENTIFICATION_STOP:
++            printf("%s: Identification stopped\n", TAG);
++            break;
++        case LOW_CODE_EVENT_TEST_MODE_LOW_CODE:
++            printf("%s: Low code test mode is triggered for subtype: %d\n", TAG, (int)*((int*)(event->event_data)));
++            break;
++        case LOW_CODE_EVENT_TEST_MODE_COMMON:
++            printf("%s: common test mode triggered\n", TAG);
++            break;
++        case LOW_CODE_EVENT_TEST_MODE_BLE:
++            printf("%s: ble test mode triggered\n", TAG);
++            break;
++        case LOW_CODE_EVENT_TEST_MODE_SNIFFER:
++            printf("%s: sniffer test mode triggered\n", TAG);
++            break;
++        default:
++            printf("%s: Unhandled event type: %d\n", TAG, event->event_type);
++            break;
++    }
++
++    return 0;
++}
+diff --git a/products/uart_sensor/main/app_main.cpp b/products/uart_sensor/main/app_main.cpp
+new file mode 100644
+index 0000000..666adae
+--- /dev/null
++++ b/products/uart_sensor/main/app_main.cpp
+@@ -0,0 +1,72 @@
++// Copyright 2024 Espressif Systems (Shanghai) PTE LTD
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include <stdio.h>
++
++#include <system.h>
++#include <low_code.h>
++
++#include "app_priv.h"
++
++static const char *TAG = "app_main";
++
++static void setup()
++{
++    /* Register callbacks */
++    low_code_register_callbacks(feature_update_from_system, event_from_system);
++
++    /* Initialize driver */
++    app_driver_init();
++}
++
++static void loop()
++{
++    /* The corresponding callbacks are called if data is received from system */
++    low_code_get_feature_update_from_system();
++    low_code_get_event_from_system();
++
++    /* Transmits the data via uart tx and receives the transmitted data */
++    app_driver_uart_echo();
++}
++
++int feature_update_from_system(low_code_feature_data_t *data)
++{
++    uint16_t endpoint_id = data->details.endpoint_id;
++    uint32_t feature_id = data->details.feature_id;
++
++    printf("%s: Feature update: endpoint: %u, feature: %lu\n", TAG, endpoint_id, feature_id);
++    return app_driver_feature_update();
++}
++
++int event_from_system(low_code_event_t *event)
++{
++    /* Handle the events from low_code_event_type_t */
++    return app_driver_event_handler(event);
++}
++
++extern "C" int main()
++{
++    printf("%s: Starting low code\n", TAG);
++
++    /* Pre-Initializations: This should be called first and should always be present */
++    system_setup();
++    setup();
++
++    /* Loop */
++    while (1) {
++        system_loop();
++        loop();
++    }
++    return 0;
++}
+diff --git a/products/uart_sensor/main/app_priv.h b/products/uart_sensor/main/app_priv.h
+new file mode 100644
+index 0000000..bbd9bf0
+--- /dev/null
++++ b/products/uart_sensor/main/app_priv.h
+@@ -0,0 +1,30 @@
++// Copyright 2024 Espressif Systems (Shanghai) PTE LTD
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#pragma once
++
++#include <stdint.h>
++#include <low_code.h>
++
++/* Driver functions */
++int app_driver_init();
++int app_driver_feature_update();
++int app_driver_uart_echo();
++
++/* Events handler */
++int app_driver_event_handler(low_code_event_t *event);
++
++/* Callbacks from system */
++int feature_update_from_system(low_code_feature_data_t *data);
++int event_from_system(low_code_event_t *event);
+diff --git a/products/uart_sensor/sdkconfig.defaults b/products/uart_sensor/sdkconfig.defaults
+new file mode 100644
+index 0000000..e69de29
+-- 
+2.34.1
+

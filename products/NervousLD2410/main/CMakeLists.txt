@@ -1,3 +1,3 @@
 idf_component_register(SRC_DIRS .
                         INCLUDE_DIRS .
-                        REQUIRES low_code system light lp_sw_timer)
+                        REQUIRES low_code system light lp_sw_timer MyLD2410)

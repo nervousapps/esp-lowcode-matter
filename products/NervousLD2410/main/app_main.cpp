@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#ifndef _app_main_c
+#define _app_main_c
+
 
 #include <stdio.h>
 
@@ -25,12 +28,16 @@
 
 static const char *TAG = "app_main";
 
-static void simulate_occupancy(lp_sw_timer_handle_t timer, void *args) {
+MyLD2410 ld2410_sensor = MyLD2410(LP_UART_NUM_0, false);
+
+void simulate_occupancy(lp_sw_timer_handle_t timer, void *args) {
     occupancy_state = !occupancy_state;
-    ESP_LOGI("", "Simulate occupancy to : %d", occupancy_state);
     if(set_occupancy(occupancy_state)){
-        ESP_LOGI("", "Simulate occupancy");
+        ESP_LOGI("", "Simulate occupancy to : %d", occupancy_state);
     }
+    int output_pin = get_output_pin();
+
+    ESP_LOGI("", "Output pin : %d", output_pin);
 }
 
 static void setup()
@@ -43,13 +50,17 @@ static void setup()
 
     lp_sw_timer_config_t timer_simulate_occupancy_cfg = {
         .periodic = true,
-        .timeout_ms = 3000,
+        .timeout_ms = 1000,
         .handler = simulate_occupancy,
         .arg = &occupancy_state,
     };
     lp_sw_timer_handle_t timer_simulate_occupancy = lp_sw_timer_create(&timer_simulate_occupancy_cfg);
 
     lp_sw_timer_start(timer_simulate_occupancy);
+
+    system_set_pin_mode(10, INPUT);
+
+    ld2410_sensor.begin();
 }
 
 static void loop()
@@ -57,6 +68,8 @@ static void loop()
     /* The corresponding callbacks are called if data is received from system */
     low_code_get_feature_update_from_system();
     low_code_get_event_from_system();
+
+    sensor_loop(ld2410_sensor);
 }
 
 int feature_update_from_system(low_code_feature_data_t *data)
@@ -119,3 +132,5 @@ extern "C" int main()
     }
     return 0;
 }
+
+#endif

@@ -1,0 +1,15 @@
+mac_address,qr_code,manual_code,device_cert,configuration,discriminator,iteration_count,salt,verifier,vendor_id,product_id,vendor_name,product_name,serial_num,rotating_device_id,hw_ver,hw_ver_str,passcode,qr_code_url
+404CCA4FBA08,MT:Y.K90MBW175O9X6KR10,0116-154-9811,"-----BEGIN CERTIFICATE-----
+MIIB/TCCAaKgAwIBAgIUNSAyDz37u1m6EDwPpzsrntxNJ0swCgYIKoZIzj0EAwIw
+PTElMCMGA1UEAwwcTWF0dGVyIERldiBQQUkgMHhGRkYxIG5vIFBJRDEUMBIGCisG
+AQQBgqJ8AgEMBEZGRjEwIBcNMjUwNDA5MTkyOTAzWhgPMjEyNTAzMTYxOTI5MDNa
+MFsxLTArBgNVBAMMJDQzMWM5MWFjLTc2NjUtNGU0MS1iNDlkLWY2NzgzMTQ0MzZk
+ZDEUMBIGCisGAQQBgqJ8AgEMBEZGRjExFDASBgorBgEEAYKifAICDAQ4MDAwMFkw
+EwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEWYKPW4HxndGLv1/R5hIe6dsZzfxABlg6
+UPl/zWg+trg7eWuXfiL7JVmQB/ZWIvC+YRnr1etjcO4v2BM2ZYCdvqNgMF4wDAYD
+VR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0OBBYEFO1ZPmMQKwlBcmQj
+dIhXHKUVuFauMB8GA1UdIwQYMBaAFGNUDkf2Sxw40TiEpGLRbBldj/s8MAoGCCqG
+SM49BAMCA0kAMEYCIQDyUHUrtN4UxU2l55Lx4s0wyhqGKXFBHFQZR03D2/W+iAIh
+ALWIH3cx4m5dFJajUjJkTAL9NerMxQPHJOZ7Ixng0Ydr
+-----END CERTIFICATE-----
+","{""config_version"":3,""pre_driver"":[{""type"":""ezc.pre_driver.power_management"",""enable_light_sleep"":true,""max_freq_mhz"":160,""min_freq_mhz"":10}],""product_common"":[{""type"":""ezc.product_common.factory_reset"",""subtype"":1,""count"":3,""auto_trigger"":true}],""test_mode"":[{""type"":""ezc.test_mode.common"",""subtype"":1},{""type"":""ezc.test_mode.ble"",""subtype"":1},{""type"":""ezc.test_mode.sniffer"",""subtype"":1,""trigger"":3},{""type"":""ezc.test_mode.low_code"",""subtype"":1,""ssid"":""test_low_code_1""},{""type"":""ezc.test_mode.low_code"",""subtype"":2,""ssid"":""test_low_code_2""},{""type"":""ezc.test_mode.low_code"",""subtype"":3,""ssid"":""test_low_code_3""}],""device_management"":true}",143,10000,Mi1Ca2ij9TFcJnX8ePHeU9dDmF/Bgtz1kR1bCh+xIPc=,9GpAct0gGzWk7Q4e22e3hP3kMJZmcWzIuRoL3Ak6zuwEhttqXrVLMYIgKHdcIXazphLBKWMYSJIE0vddR/1poNxBo2rQDttb3sZm5YKkNjIhAXFHeMpQc/K/nfuDIqqQBg==,65521,32768,Espressif,Matter Product,431c91ac76654e41b49df678314436dd,60f52a6d7818a5baad5efddcc4a81879,1,1,81620319,https://project-chip.github.io/connectedhomeip/qrcode.html?data=MT:Y.K90MBW175O9X6KR10
