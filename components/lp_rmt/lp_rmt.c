@@ -96,7 +96,7 @@ static bool lp_rmt_config_gpio(lp_rmt_channel_t* channel) {
     printf("Initialize and configure GPIO to work with RMT on LP core...\n");
 
     /* gpio matrix config: 1. func: gpio, 2. I/O/D */
-    gpio_ll_iomux_func_sel(GPIO_PIN_MUX_REG[channel->gpioPin], PIN_FUNC_GPIO);
+    // gpio_ll_iomux_func_sel(GPIO_PIN_MUX_REG[channel->gpioPin], PIN_FUNC_GPIO);
     gpio_ll_output_enable(&GPIO, channel->gpioPin);
     gpio_ll_pullup_en(&GPIO, channel->gpioPin);
     gpio_ll_input_disable(&GPIO, channel->gpioPin);

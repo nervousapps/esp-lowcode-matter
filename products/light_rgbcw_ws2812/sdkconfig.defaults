@@ -1,3 +1,0 @@
-# set light driver to ws2812
-CONFIG_USE_LIGHT_DEVICE_TYPE_WS2812=y
-
