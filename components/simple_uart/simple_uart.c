@@ -415,9 +415,9 @@ int simple_uart_read_bytes(uart_port_t uart_num, void *buf, size_t size, int32_t
     return bytes_rcvd;
 }
 
-int simple_uart_read_byte(uart_port_t uart_num)
+uint8_t simple_uart_read_byte(uart_port_t uart_num)
 {
-    int buf;
+    uint8_t *buf;
     int32_t timeout = 5;
     
     hal.dev = (uart_dev_t*)UART_LL_GET_HW(uart_num);
@@ -444,7 +444,7 @@ int simple_uart_read_byte(uart_port_t uart_num)
          * We set rx_len to -1 to read all bytes in the Rx FIFO
          */
         rx_len = 1;
-        uart_hal_read_rxfifo(&hal, (uint8_t *)buf, &rx_len);
+        uart_hal_read_rxfifo(&hal, (uint8_t *)(buf + bytes_rcvd), &rx_len);
         if (rx_len) {
             /* We have some data to read from the Rx FIFO. Check Rx interrupt status */
             intr_status = uart_hal_get_intsts_mask(&hal);
@@ -481,7 +481,7 @@ int simple_uart_read_byte(uart_port_t uart_num)
     uart_hal_disable_intr_mask(&hal, intr_mask);
 
     /* Return the received byte */
-    return buf;
+    return *buf;
 }
 
 int simple_uart_availaible(uart_port_t uart_num) {

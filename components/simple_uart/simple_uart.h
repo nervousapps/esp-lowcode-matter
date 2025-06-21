@@ -63,7 +63,7 @@ esp_err_t simple_uart_write_bytes(uart_port_t uart_num, const void *src, size_t 
 
 int simple_uart_availaible(uart_port_t uart_num);
 
-int simple_uart_read_byte(uart_port_t uart_num);
+uint8_t simple_uart_read_byte(uart_port_t uart_num);
 
 #ifdef __cplusplus
 }

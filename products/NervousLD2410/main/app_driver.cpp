@@ -30,8 +30,6 @@
 
 #define WS2812_CTRL_IO ((gpio_num_t)8)
 
-#define LP_UART_PORT_NUM LP_UART_NUM_0
-
 static const char *TAG = "app_driver";
 
 int app_driver_init()
@@ -57,35 +55,7 @@ int app_driver_init()
     light_driver_set_saturation(100);
     light_driver_set_brightness(100);
 
-    occupancy_state = system_digital_read(10);
-
-    // printf("%s: Initializing driver\n", TAG);
-
-    // /* uart driver config */
-    // static uart_cfg_t ld2410_uart_cfg = {
-    //     .uart_pin_cfg = {
-    //         .tx_io_num = TX_GPIO_NUM,
-    //         .rx_io_num = RX_GPIO_NUM,
-    //         .rts_io_num = RTS_GPIO_NUM,
-    //         .cts_io_num = CTS_GPIO_NUM,
-    //     },
-    //     /* Default UART protocol config */
-    //     .uart_proto_cfg = {
-    //         .baud_rate = LD2410_BAUD_RATE,
-    //         .data_bits = UART_DATA_8_BITS,
-    //         .parity = UART_PARITY_DISABLE,
-    //         .stop_bits = UART_STOP_BITS_1,
-    //         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-    //         .rx_flow_ctrl_thresh = 0,
-    //     },
-    // };
-
-    // /* initialise the uart drvier */
-    // esp_err_t err = simple_uart_init(LP_UART_PORT_NUM, ld2410_uart_cfg);
-    // if (err != ESP_OK)
-    // {
-    //     printf("%s: Failed to initialise the UART driver\n", TAG);
-    // }
+    // occupancy_state = system_digital_read(10);
 
     printf("%s: App driver init\n", TAG);
     return 0;
@@ -256,25 +226,21 @@ int get_output_pin()
 
 void sensor_loop(MyLD2410 ld2410_sensor)
 {
-    ESP_LOGI("", "In sensor loop");
-    // // char c = simple_uart_read_byte(LP_UART_PORT_NUM);
-    // // const char *hexDigits = "0123456789ABCDEF";
-    // // std::string hexStr;
-    // // hexStr += hexDigits[(c >> 4) & 0x0F];
-    // // hexStr += hexDigits[c & 0x0F];
-    // // printf("%s : ###################### %s\n", TAG, hexStr.c_str());
     MyLD2410::Response resp = ld2410_sensor.check();
-    ESP_LOGI("", "Check : %d", resp);
     if ((resp == MyLD2410::Response::DATA))
     {
         if (ld2410_sensor.presenceDetected())
         {
-            ESP_LOGI("", "Presence detected");
+            ESP_LOGI("", "Presence detected\n");
+            set_occupancy(true);
         }
         else
         {
-            ESP_LOGI("", "Presence not detected");
+            ESP_LOGI("", "Presence not detected\n");
+            set_occupancy(false);
         }
+
+        ESP_LOGI("", "%s", ld2410_sensor.statusString());
     }
 }
 

@@ -28,16 +28,22 @@
 
 static const char *TAG = "app_main";
 
-MyLD2410 ld2410_sensor = MyLD2410(LP_UART_NUM_0, false);
+MyLD2410 ld2410_sensor = MyLD2410(UART_NUM_1, true);
 
 void simulate_occupancy(lp_sw_timer_handle_t timer, void *args) {
     occupancy_state = !occupancy_state;
     if(set_occupancy(occupancy_state)){
         ESP_LOGI("", "Simulate occupancy to : %d", occupancy_state);
     }
-    int output_pin = get_output_pin();
+    // int output_pin = get_output_pin();
 
-    ESP_LOGI("", "Output pin : %d", output_pin);
+    // ESP_LOGI("", "Output pin : %d", output_pin);
+
+    // sensor_loop(ld2410_sensor);
+}
+
+void check_sensor(lp_sw_timer_handle_t timer, void *args) {
+    sensor_loop(ld2410_sensor);
 }
 
 static void setup()
@@ -48,19 +54,35 @@ static void setup()
     /* Initialize driver */
     app_driver_init();
 
-    lp_sw_timer_config_t timer_simulate_occupancy_cfg = {
-        .periodic = true,
-        .timeout_ms = 1000,
-        .handler = simulate_occupancy,
-        .arg = &occupancy_state,
-    };
-    lp_sw_timer_handle_t timer_simulate_occupancy = lp_sw_timer_create(&timer_simulate_occupancy_cfg);
+    // lp_sw_timer_config_t timer_simulate_occupancy_cfg = {
+    //     .periodic = true,
+    //     .timeout_ms = 1000,
+    //     .handler = simulate_occupancy,
+    //     .arg = &occupancy_state,
+    // };
+    // lp_sw_timer_handle_t timer_simulate_occupancy = lp_sw_timer_create(&timer_simulate_occupancy_cfg);
 
-    lp_sw_timer_start(timer_simulate_occupancy);
+    // lp_sw_timer_start(timer_simulate_occupancy);
 
-    system_set_pin_mode(10, INPUT);
+    // system_set_pin_mode(10, INPUT);
 
     ld2410_sensor.begin();
+
+    bool is_enhance = ld2410_sensor.enhancedMode(true);
+    if(is_enhance)
+        printf("############ In enhance mode");
+    else
+        printf("############ Failed enhance mode");
+
+    lp_sw_timer_config_t timer_check_sensor_cfg = {
+        .periodic = true,
+        .timeout_ms = 10,
+        .handler = check_sensor,
+        .arg = &occupancy_state,
+    };
+    lp_sw_timer_handle_t timer_check_sensor = lp_sw_timer_create(&timer_check_sensor_cfg);
+
+    lp_sw_timer_start(timer_check_sensor);
 }
 
 static void loop()
@@ -68,8 +90,6 @@ static void loop()
     /* The corresponding callbacks are called if data is received from system */
     low_code_get_feature_update_from_system();
     low_code_get_event_from_system();
-
-    sensor_loop(ld2410_sensor);
 }
 
 int feature_update_from_system(low_code_feature_data_t *data)
@@ -78,9 +98,9 @@ int feature_update_from_system(low_code_feature_data_t *data)
     uint16_t endpoint_id = data->details.endpoint_id;
     uint32_t feature_id = data->details.feature_id;
 
-    printf("Endpoint id : %d", endpoint_id);
-    ESP_LOGI("", "Endpoint id : %d", endpoint_id);
-    ESP_LOGI("", "Feature id : %u", (unsigned int)feature_id);
+    // printf("Endpoint id : %d", endpoint_id);
+    // ESP_LOGI("", "Endpoint id : %d", endpoint_id);
+    // ESP_LOGI("", "Feature id : %u", (unsigned int)feature_id);
 
     if (endpoint_id == 1) {
         if (feature_id == LOW_CODE_FEATURE_ID_POWER) {  // Power

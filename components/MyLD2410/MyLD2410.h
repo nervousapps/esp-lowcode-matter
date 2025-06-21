@@ -10,6 +10,7 @@
 #include <esp_log.h>
 
 #include "simple_uart.h"
+#include "queue.h"
 
 /*
 
@@ -23,7 +24,7 @@ https://github.com/iavorvel/MyLD2410
  * @file MyLD2410.h
  */
 // Config
-#define LD2410_BAUD_RATE  115200
+#define LD2410_BAUD_RATE  256000
 #define LD2410_BUFFER_SIZE 0x40
 #define LD2410_LATEST_FIRMWARE "2.44"
 #define LD2410_MAX_FRAME_LENGTH 40
@@ -115,24 +116,24 @@ public:
 
 private:
   SensorData sData;
-//   ValuesArray stationaryThresholds;
-//   ValuesArray movingThresholds;
+  ValuesArray stationaryThresholds;
+  ValuesArray movingThresholds;
   uint8_t maxRange = 0;
   uint8_t noOne_window = 0;
   uint8_t lightLevel = 0;
   uint8_t outLevel = 0;
   uint8_t lightThreshold = 0;
-//   LightControl lightControl = LightControl::NOT_SET;
-//   OutputControl outputControl = OutputControl::NOT_SET;
-//   AutoStatus autoStatus = AutoStatus::NOT_SET;
-//   unsigned long version = 0;
-//   unsigned long bufferSize = 0;
-//   uint8_t MAC[6];
-//   std::string  MACstr = "";
-//   std::string  firmware = "";
-//   uint8_t firmwareMajor = 0;
-//   uint8_t firmwareMinor = 0;
-//   int fineRes = -1;
+  LightControl lightControl = LightControl::NOT_SET;
+  OutputControl outputControl = OutputControl::NOT_SET;
+  AutoStatus autoStatus = AutoStatus::NOT_SET;
+  unsigned long version = 0;
+  unsigned long bufferSize = 0;
+  uint8_t MAC[6];
+  // std::string  MACstr = "None";
+  // std::string  firmware = "None";
+  uint8_t firmwareMajor = 0;
+  uint8_t firmwareMinor = 0;
+  int fineRes = -1;
   bool isEnhanced = false;
   bool isConfig = false;
   unsigned long timeout = 2000;
@@ -141,13 +142,16 @@ private:
   uint8_t inBufI = 0;
   uint8_t headBuf[4];
   uint8_t headBufI = 0;
-  uart_port_t UART_PORT_NUM = LP_UART_NUM_0;
+  uart_port_t UART_PORT_NUM = UART_NUM_1;
   bool _debug = false;
   bool isDataValid();
   bool readFrame();
   bool sendCommand(const uint8_t *command);
-//   bool processAck();
+  bool processAck();
   bool processData();
+
+  Queue q;
+  int rx_read_len = 0;
 
 public:
   /**
@@ -156,7 +160,7 @@ public:
    * @param serial - a reference to a stream object (sensorSerial)
    * @param debug - a flag that controls whether debug data will be sent to Serial
    */
-  MyLD2410(uart_port_t uart_port_num = LP_UART_NUM_0, bool debug = false);
+  MyLD2410(uart_port_t uart_port_num = UART_NUM_1, bool debug = false);
 
   // CONTROLS
 
@@ -168,19 +172,19 @@ public:
   // /**
   //  * @brief Call this function to gracefully close the sensor. Useful for entering sleep mode.
   //  */
-  // void end();
+  void end();
 
   // /**
   //  * @brief Set the debug flag
   //  *
   //  */
-  // void debugOn();
+  void debugOn();
 
   // /**
   //  * @brief Reset the debug flag
   //  *
   //  */
-  // void debugOff();
+  void debugOff();
 
   /**
     @brief Call this function in the main loop
@@ -196,19 +200,19 @@ public:
   //  * @brief Check whether the device is in config mode
   //  * (accepts commands)
   //  */
-  // bool inConfigMode();
+  bool inConfigMode();
 
   // /**
   //  * @brief Check whether the device is in basic mode
   //  * (continuously sends basic presence data)
   //  */
-  // bool inBasicMode();
+  bool inBasicMode();
 
   // /**
   //  * @brief Check whether the device is in enhanced mode
   //  * (continuously sends enhanced presence data)
   //  */
-  // bool inEnhancedMode();
+  bool inEnhancedMode();
 
   // /**
   //  * @brief Get the status of the sensor:
@@ -223,7 +227,7 @@ public:
   //  *
   //  * @return uint8_t
   //  */
-  // uint8_t getStatus();
+  uint8_t getStatus();
 
   // /**
   //  * @brief Get the presence status as a c-string
@@ -237,7 +241,7 @@ public:
   //  * "Auto thresholds successful",
   //  * "Auto thresholds failed".
   //  */
-  // const char *statusString();
+  const char *statusString();
 
   /**
    * @brief Check whether presence was detected in the latest frame
@@ -247,61 +251,61 @@ public:
   // /**
   //  * @brief Check whether a stationary target was detected in the latest frame
   //  */
-  // bool stationaryTargetDetected();
+  bool stationaryTargetDetected();
 
   // /**
   //  * @brief Get the distance to the stationary target in [cm]
   //  *
   //  * @return unsigned long - distance in [cm]
   //  */
-  // unsigned long stationaryTargetDistance();
+  unsigned long stationaryTargetDistance();
 
   // /**
   //  * @brief Get the signal from the stationary target
   //  *
   //  * @return uint8_t - signal value [0:100]
   //  */
-  // uint8_t stationaryTargetSignal();
+  uint8_t stationaryTargetSignal();
 
   // /**
   //  * @brief Get the Stationary Signals object, if in enhanced mode
   //  *
   //  * @return const MyLD2410::ValuesArray& - the signals for each detection gate
   //  */
-  // const ValuesArray &getStationarySignals();
+  const ValuesArray &getStationarySignals();
 
   // /**
   //  * @brief Check whether a moving target was detected in the latest frame
   //  */
-  // bool movingTargetDetected();
+  bool movingTargetDetected();
 
   // /**
   //  * @brief Get the distance to the moving target in [cm]
   //  *
   //  * @return unsigned long - distance in [cm]
   //  */
-  // unsigned long movingTargetDistance();
+  unsigned long movingTargetDistance();
 
   // /**
   //  * @brief Get the signal from the moving target
   //  *
   //  * @return uint8_t - signal value [0:100]
   //  */
-  // uint8_t movingTargetSignal();
+  uint8_t movingTargetSignal();
 
   // /**
   //  * @brief Get the Moving Signals object, if in enhanced mode
   //  *
   //  * @return const MyLD2410::ValuesArray& - the signals for each detection gate
   //  */
-  // const ValuesArray &getMovingSignals();
+  const ValuesArray &getMovingSignals();
 
   // /**
   //  * @brief Get the detected distance
   //  *
   //  * @return unsigned long - distance in [cm]
   //  */
-  // unsigned long detectedDistance();
+  unsigned long detectedDistance();
 
   // /**
   //  * @brief Get the Bluetooth MAC address as an array uint8_t[6]
@@ -407,7 +411,7 @@ public:
   //  * @param enable [true]/false
   //  * @return true on success
   //  */
-  // bool configMode(bool enable = true);
+  bool configMode(bool enable = true);
 
   // /**
   //  * @brief Request enhanced mode
@@ -415,7 +419,7 @@ public:
   //  * @param enable [true]/false
   //  * @return true on success
   //  */
-  // bool enhancedMode(bool enable = true);
+  bool enhancedMode(bool enable = true);
 
   // /**
   //  * @brief Request the current auxiliary configuration
@@ -453,7 +457,7 @@ public:
   //  *
   //  * @return true on success
   //  */
-  // bool requestFirmware();
+  bool requestFirmware();
 
   // /**
   //  * @brief Request the resolution (gate-width)

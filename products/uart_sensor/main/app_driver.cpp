@@ -19,15 +19,16 @@
 
 #include "app_priv.h"
 #include "simple_uart.h"
+#include "queue.h"
 
 static const char *TAG = "app_driver";
 
-#define RX_GPIO_NUM     (gpio_num_t)GPIO_NUM_8
-#define TX_GPIO_NUM     (gpio_num_t)GPIO_NUM_10
+#define RX_GPIO_NUM     (gpio_num_t)GPIO_NUM_4
+#define TX_GPIO_NUM     (gpio_num_t)GPIO_NUM_5
 #define RTS_GPIO_NUM    (gpio_num_t)(-1)
 #define CTS_GPIO_NUM    (gpio_num_t)(-1)
 
-#define RX_BUFFER_SIZE  50
+#define RX_BUFFER_SIZE  0x40
 #define TX_BUFFER_SIZE  50
 
 // #define UART_PORT_NUM    LP_UART_NUM_0
@@ -38,21 +39,21 @@ int app_driver_uart_echo(void)
     static int count = 0;
 
     /* creating the tx buffer */
-    char tx_buffer[TX_BUFFER_SIZE];
-    int tx_len = snprintf(tx_buffer, TX_BUFFER_SIZE, "%d: Hello", ++count);
+    // char tx_buffer[TX_BUFFER_SIZE];
+    // int tx_len = snprintf(tx_buffer, TX_BUFFER_SIZE, "%d: Hello", ++count);
 
-    /* checking for buffer overflow */
-    if (tx_len >= 50) {
-        printf("%s: rx buffer overflow, please increase the rx buffer size", TAG);
-    }
+    // /* checking for buffer overflow */
+    // if (tx_len >= 50) {
+    //     printf("%s: rx buffer overflow, please increase the rx buffer size", TAG);
+    // }
 
     /* transmiting tx_buiffer via uart port */
-    esp_err_t ret = simple_uart_write_bytes(UART_PORT_NUM, tx_buffer, tx_len, 500);
-    if (ret != ESP_OK) {
-        printf("%s: Error in transmiting data\n", TAG);
-        esp_amp_platform_delay_ms(200);
-        return -1;
-    }
+    // esp_err_t ret = simple_uart_write_bytes(UART_PORT_NUM, tx_buffer, tx_len, 500);
+    // if (ret != ESP_OK) {
+    //     printf("%s: Error in transmiting data\n", TAG);
+    //     esp_amp_platform_delay_ms(200);
+    //     return -1;
+    // }
 
     /* delay of 10 ms */
     esp_amp_platform_delay_ms(10);
@@ -62,12 +63,31 @@ int app_driver_uart_echo(void)
     int rx_len = simple_uart_read_bytes(UART_PORT_NUM, rx_buffer, RX_BUFFER_SIZE, 10);
 
     if (rx_len > 0) {
+        Queue q;
         /* printing the received data */
-        printf("%s: Received UART Data:\n%s\n", TAG, rx_buffer);
+        printf("%s: Received UART Data: %d\n", TAG, rx_len);
+        for (int i = 0; i < rx_len; i++)
+        {
+            // printf("%02X", rx_buffer[i]);
+            q.enqueue(rx_buffer[i]);
+        }
+        printf("\n");
+
+        for (int i = 0; i < rx_len; i++)
+        {
+            printf("%02X\n", q.dequeue());
+        }
+        // q.display();
     }
 
+    // while(simple_uart_availaible(UART_PORT_NUM)) {
+    //     char buf = simple_uart_read_byte(UART_PORT_NUM);
+    //     printf("%02X", buf);
+    // }
+    // printf("\n");
+
     /* delay of 1 sec */
-    esp_amp_platform_delay_ms(1000);
+    // esp_amp_platform_delay_ms(1000);
 
     return 0;
 }
@@ -86,7 +106,7 @@ int app_driver_init()
         },
         /* Default UART protocol config */
         .uart_proto_cfg = {
-            .baud_rate = 115200,
+            .baud_rate = 256000,
             .data_bits = UART_DATA_8_BITS,
             .parity = UART_PARITY_DISABLE,
             .stop_bits = UART_STOP_BITS_1,
